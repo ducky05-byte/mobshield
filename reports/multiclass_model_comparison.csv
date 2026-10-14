@@ -1,0 +1,5 @@
+Model,Train Time (s),Val Macro-F1,Test Macro-F1,Test Accuracy,Benign False Alarm (%),Holdout Macro-F1,Latency (ms),Throughput (flows/s)
+Baseline_LogisticRegression,754.06,0.174,0.1743,0.3435,62.22,0.1736,0.3194,234115.3
+RandomForest,36.93,0.2588,0.2552,0.5035,43.95,0.2081,55.8813,9474.1
+ExtraTrees,38.05,0.2527,0.2466,0.5192,41.18,0.1788,38.7304,24478.0
+LightGBM,6.08,0.2252,0.2171,0.3614,62.76,0.2628,1.6614,134850.9

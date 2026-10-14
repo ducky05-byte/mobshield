@@ -1,0 +1,43 @@
+
+services:
+  backend:
+    image: mobileshield:latest
+    build: .
+    container_name: mobileshield-api
+    command: ["uvicorn", "src.companion_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      ADMIN_API_TOKEN: "${ADMIN_API_TOKEN:?Set ADMIN_API_TOKEN to a 64-character random hex token}"
+      RELAY_SECRET: "${RELAY_SECRET:?Set RELAY_SECRET to a 64-character random hex token}"
+      DEVICE_PAIRING_CODE: "${DEVICE_PAIRING_CODE:?Set DEVICE_PAIRING_CODE to an operator-issued one-use code}"
+      DEVICE_AUTH_DB_PATH: "/app/data/device_auth.sqlite3"
+    volumes:
+      - captures:/app/captures
+      - device_auth:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/status', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  dashboard:
+    image: mobileshield:latest
+    container_name: mobileshield-dashboard
+    command: ["streamlit", "run", "src/dashboard.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      API_BASE_URL: "http://backend:8000"
+      ADMIN_API_TOKEN: "${ADMIN_API_TOKEN:?Set ADMIN_API_TOKEN to a 64-character random hex token}"
+    volumes:
+      - captures:/app/captures
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  captures:
+  device_auth:
