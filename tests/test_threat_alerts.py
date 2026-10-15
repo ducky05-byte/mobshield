@@ -25,8 +25,59 @@ setattr(__main__, "NetworkFlowPreprocessor", NetworkFlowPreprocessor)
 from src.companion_api import app, engine, ADMIN_API_TOKEN
 from src.flow_engine import LiveCapturePipeline, BidirectionalFlow
 from src.sample_threats import get_genuine_sample_flow
+from src.predict_flow import FlowPredictor
 from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
+
+
+def _empty_inference_diagnostics():
+    return {
+        "flows_completed": 0,
+        "flows_submitted_for_inference": 0,
+        "predictions_succeeded": 0,
+        "predictions_failed": 0,
+        "feature_extraction_failures": 0,
+        "packet_parse_errors": 0,
+        "flow_aggregation_errors": 0,
+        "alerts_rejected_threshold": 0,
+        "alerts_rejected_class_mapping": 0,
+        "alerts_stored": 0,
+        "last_error": None,
+        "recent_predictions": [],
+    }
+
+
+def _synthetic_flow():
+    key = ("192.0.2.10", "198.51.100.20", 50000, 443, 6)
+    packet = IP(src=key[0], dst=key[1]) / TCP(
+        sport=key[2], dport=key[3], flags="S"
+    )
+    packet.time = time.time()
+    return key, BidirectionalFlow(packet, key)
+
+
+class _StubPredictor:
+    def __init__(self, malware_probability, multiclass_label="RANSOMWARE"):
+        self.malware_probability = malware_probability
+        self.multiclass_label = multiclass_label
+
+    def predict_flow(self, _features, mode="binary"):
+        if mode == "binary":
+            return {
+                "label": (
+                    "MALWARE_ASSOCIATED"
+                    if self.malware_probability >= 0.5
+                    else "BENIGN"
+                ),
+                "confidence": max(
+                    self.malware_probability, 1 - self.malware_probability
+                ),
+                "probabilities": {
+                    "BENIGN": 1 - self.malware_probability,
+                    "MALWARE_ASSOCIATED": self.malware_probability,
+                },
+            }
+        return {"label": self.multiclass_label, "confidence": 0.8}
 
 
 @pytest.fixture
@@ -42,12 +93,16 @@ def reset_engine_state():
         engine.alerts.clear()
         engine.recent_flows.clear()
         engine.active_flows.clear()
+        engine.inference_diagnostics.clear()
+        engine.inference_diagnostics.update(_empty_inference_diagnostics())
     yield
     engine.detection_threshold = 0.65
     with engine.lock:
         engine.alerts.clear()
         engine.recent_flows.clear()
         engine.active_flows.clear()
+        engine.inference_diagnostics.clear()
+        engine.inference_diagnostics.update(_empty_inference_diagnostics())
 
 
 # -------------------------------------------------------------
@@ -135,6 +190,100 @@ def test_probability_above_cutoff_follows_alert_policy(client):
     alert = telem["alerts"][0]
     assert alert["multiclass_category"] == flow["multiclass_category"]
     assert alert["malware_probability"] == flow["malware_probability"]
+
+
+def test_live_inference_threshold_boundary_persists_alert(client, monkeypatch):
+    engine.detection_threshold = 0.60
+    monkeypatch.setattr(engine, "predictor", _StubPredictor(0.60))
+    key, flow = _synthetic_flow()
+
+    engine._submit_flow_for_inference(key, flow)
+
+    telemetry = client.get("/api/telemetry").json()
+    diagnostics = telemetry["inference_diagnostics"]
+    assert diagnostics["flows_completed"] == 1
+    assert diagnostics["flows_submitted_for_inference"] == 1
+    assert diagnostics["predictions_succeeded"] == 1
+    assert diagnostics["alerts_stored"] == 1
+    assert diagnostics["alerts_rejected_threshold"] == 0
+    assert diagnostics["alerts_rejected_class_mapping"] == 0
+    assert diagnostics["recent_predictions"][0]["malware_probability"] == 0.6
+    assert diagnostics["recent_predictions"][0]["decision"] == "ALERT_STORED"
+    assert "src_ip" not in diagnostics["recent_predictions"][0]
+    assert "raw_packet_hex" not in diagnostics["recent_predictions"][0]
+    assert len(telemetry["alerts"]) == 1
+    assert telemetry["alerts"][0]["multiclass_category"] == "RANSOMWARE"
+
+
+def test_live_inference_rejects_probability_below_threshold(monkeypatch):
+    engine.detection_threshold = 0.60
+    monkeypatch.setattr(engine, "predictor", _StubPredictor(0.5999))
+    key, flow = _synthetic_flow()
+
+    engine._submit_flow_for_inference(key, flow)
+
+    assert engine.alerts == []
+    assert engine.inference_diagnostics["alerts_rejected_threshold"] == 1
+    assert engine.inference_diagnostics["alerts_rejected_class_mapping"] == 0
+    assert engine.inference_diagnostics["recent_predictions"][0]["decision"] == "BELOW_THRESHOLD"
+
+
+def test_live_inference_rejects_unsupported_predicted_family(monkeypatch):
+    engine.detection_threshold = 0.60
+    monkeypatch.setattr(
+        engine, "predictor", _StubPredictor(0.8, multiclass_label="UNMAPPED_CLASS")
+    )
+    key, flow = _synthetic_flow()
+
+    engine._submit_flow_for_inference(key, flow)
+
+    assert engine.alerts == []
+    assert engine.inference_diagnostics["alerts_rejected_class_mapping"] == 1
+    assert engine.inference_diagnostics["recent_predictions"][0]["decision"] == "UNSUPPORTED_FAMILY"
+
+
+def test_prediction_failure_is_counted_without_exposing_exception_text(monkeypatch):
+    class FailedPredictor:
+        def predict_flow(self, _features, mode="binary"):
+            raise RuntimeError("failure includes sensitive packet details")
+
+    monkeypatch.setattr(engine, "predictor", FailedPredictor())
+    key, flow = _synthetic_flow()
+
+    engine._submit_flow_for_inference(key, flow)
+
+    diagnostics = engine.inference_diagnostics
+    assert diagnostics["predictions_failed"] == 1
+    assert diagnostics["last_error"] == {
+        "stage": "binary_inference",
+        "error_type": "RuntimeError",
+    }
+    assert "sensitive packet details" not in str(diagnostics)
+    assert "src_ip" not in diagnostics["recent_predictions"][0]
+
+
+def test_predictor_maps_probabilities_by_model_class_order():
+    class ReorderedBinaryModel:
+        classes_ = [1, 0]
+
+        def predict(self, _features):
+            return [1]
+
+        def predict_proba(self, _features):
+            return [[0.8, 0.2]]
+
+    predictor = FlowPredictor()
+    predictor.binary_model = ReorderedBinaryModel()
+    feature_vector = {name: 0.0 for name in predictor.feature_names}
+
+    result = predictor.predict_flow(feature_vector, mode="binary")
+
+    assert result["label"] == "MALWARE_ASSOCIATED"
+    assert result["confidence"] == 0.8
+    assert result["probabilities"] == {
+        "MALWARE_ASSOCIATED": 0.8,
+        "BENIGN": 0.2,
+    }
 
 
 # -------------------------------------------------------------

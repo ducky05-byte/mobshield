@@ -267,6 +267,20 @@ class IngestionEngine:
         self.predictor = FlowPredictor(model_dir=MODEL_DIR)
         mark_model_artifacts_validated(MODEL_DIR)
         self.detection_threshold = 0.65
+        self.inference_diagnostics = {
+            "flows_completed": 0,
+            "flows_submitted_for_inference": 0,
+            "predictions_succeeded": 0,
+            "predictions_failed": 0,
+            "feature_extraction_failures": 0,
+            "packet_parse_errors": 0,
+            "flow_aggregation_errors": 0,
+            "alerts_rejected_threshold": 0,
+            "alerts_rejected_class_mapping": 0,
+            "alerts_stored": 0,
+            "last_error": None,
+            "recent_predictions": [],
+        }
 
         # Periodic flush worker
         self._stop_event = threading.Event()
@@ -329,8 +343,8 @@ class IngestionEngine:
             if rec.raw_packet_hex:
                 try:
                     raw_bytes = bytes.fromhex(rec.raw_packet_hex)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._record_ingestion_error("packet_decode", exc)
 
             # Synthetic packet assembly if raw_packet_hex wasn't sent
             if not raw_bytes:
@@ -346,8 +360,8 @@ class IngestionEngine:
                     if payload_len > 0:
                         p = p / Raw(load=b"\x00" * payload_len)
                     raw_bytes = bytes(p)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._record_ingestion_error("packet_reconstruction", exc)
 
             # Record raw PCAP if recording active
             if self.pcap_recorder and raw_bytes:
@@ -375,8 +389,9 @@ class IngestionEngine:
                         else:
                             scapy_pkt = IP(raw_bytes)
                         scapy_pkt.time = rec.timestamp
-                    except Exception:
+                    except Exception as exc:
                         scapy_pkt = None
+                        self._record_ingestion_error("packet_decode", exc)
 
                 if scapy_pkt is None:
                     is_v6 = ":" in rec.src_ip or ":" in rec.dst_ip
@@ -398,8 +413,19 @@ class IngestionEngine:
                     self.active_flows[target_key] = BidirectionalFlow(scapy_pkt, target_key)
                 else:
                     self.active_flows[target_key].add_packet(scapy_pkt)
-            except Exception as e:
-                pass
+            except Exception as exc:
+                self.inference_diagnostics["flow_aggregation_errors"] += 1
+                self.inference_diagnostics["last_error"] = {
+                    "stage": "flow_aggregation",
+                    "error_type": type(exc).__name__,
+                }
+
+    def _record_ingestion_error(self, stage: str, error: Exception) -> None:
+        self.inference_diagnostics["packet_parse_errors"] += 1
+        self.inference_diagnostics["last_error"] = {
+            "stage": stage,
+            "error_type": type(error).__name__,
+        }
 
     def _flow_maintenance_loop(self):
         """Periodically flushes completed flows and executes model inference."""
@@ -419,10 +445,52 @@ class IngestionEngine:
 
             # Run inference outside lock
             for key, flow in flows_to_classify:
-                self._classify_flow(key, flow)
+                self._submit_flow_for_inference(key, flow)
+
+    def _submit_flow_for_inference(self, key: tuple, flow: BidirectionalFlow) -> None:
+        with self.lock:
+            self.inference_diagnostics["flows_completed"] += 1
+            self.inference_diagnostics["flows_submitted_for_inference"] += 1
+        self._classify_flow(key, flow)
+
+    def _record_classification_failure(
+        self,
+        key: tuple,
+        flow: BidirectionalFlow,
+        stage: str,
+        error_type: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        diagnostic = self.inference_diagnostics
+        if stage == "feature_extraction":
+            diagnostic["feature_extraction_failures"] += 1
+        else:
+            diagnostic["predictions_failed"] += 1
+        diagnostic["last_error"] = {"stage": stage, "error_type": error_type}
+        diagnostic["recent_predictions"].insert(0, {
+            "timestamp": time.strftime("%H:%M:%S"),
+            "decision": "PREDICTION_FAILED",
+            "stage": stage,
+            "error_type": error_type,
+        })
+        del diagnostic["recent_predictions"][20:]
+        self.recent_flows.insert(0, {
+            "timestamp": time.strftime("%H:%M:%S"),
+            "src_ip": key[0],
+            "dst_ip": key[1],
+            "src_port": key[2],
+            "dst_port": key[3],
+            "protocol": str(key[4]),
+            "packets": flow.fwd_packets + flow.bwd_packets,
+            "bytes": sum(flow.fwd_lengths) + sum(flow.bwd_lengths),
+            "status": "NOT_CLASSIFIED",
+            "reason": reason or f"{stage} failed ({error_type})",
+        })
+        del self.recent_flows[100:]
 
     def _classify_flow(self, key: tuple, flow: BidirectionalFlow):
         """Extracts 65 features and scores with FlowPredictor after strict schema verification."""
+        stage = "feature_extraction"
         try:
             feat_dict = flow.to_feature_dict()
 
@@ -430,49 +498,48 @@ class IngestionEngine:
             missing_features = [f for f in EXPECTED_FEATURES if f not in feat_dict]
             if missing_features:
                 with self.lock:
-                    self.recent_flows.insert(0, {
-                        "timestamp": time.strftime("%H:%M:%S", time.localtime(flow.start_time)),
-                        "src_ip": key[0],
-                        "dst_ip": key[1],
-                        "src_port": key[2],
-                        "dst_port": key[3],
-                        "protocol": "TCP" if key[4] == 6 else ("UDP" if key[4] == 17 else str(key[4])),
-                        "packets": flow.fwd_packets + flow.bwd_packets,
-                        "bytes": sum(flow.fwd_lengths) + sum(flow.bwd_lengths),
-                        "status": "NOT_CLASSIFIED",
-                        "reason": f"Incompatible feature schema: missing {len(missing_features)} features ({missing_features[:3]}...)"
-                    })
+                    self._record_classification_failure(
+                        key,
+                        flow,
+                        "feature_extraction",
+                        "FeatureSchemaError",
+                        (
+                            "Incompatible feature schema: missing "
+                            f"{len(missing_features)} features "
+                            f"({missing_features[:3]}...)"
+                        ),
+                    )
                 return
 
             # Check for non-finite values
             has_nan = any(not isinstance(v, (int, float)) or math.isnan(v) or math.isinf(v) for v in feat_dict.values())
             if has_nan:
                 with self.lock:
-                    self.recent_flows.insert(0, {
-                        "timestamp": time.strftime("%H:%M:%S", time.localtime(flow.start_time)),
-                        "src_ip": key[0],
-                        "dst_ip": key[1],
-                        "src_port": key[2],
-                        "dst_port": key[3],
-                        "protocol": "TCP" if key[4] == 6 else ("UDP" if key[4] == 17 else str(key[4])),
-                        "packets": flow.fwd_packets + flow.bwd_packets,
-                        "bytes": sum(flow.fwd_lengths) + sum(flow.bwd_lengths),
-                        "status": "NOT_CLASSIFIED",
-                        "reason": "Flow vector contains NaN or infinite values"
-                    })
+                    self._record_classification_failure(
+                        key,
+                        flow,
+                        "feature_extraction",
+                        "NonFiniteFeatureError",
+                        "Flow vector contains NaN or infinite values",
+                    )
                 return
 
             t0 = time.perf_counter()
+            stage = "binary_inference"
             bin_res = self.predictor.predict_flow(feat_dict, mode="binary")
             lat_ms = (time.perf_counter() - t0) * 1000.0
 
-            mal_prob = bin_res["probabilities"].get("MALWARE_ASSOCIATED", 0.0)
+            probabilities = bin_res.get("probabilities", {})
+            if "MALWARE_ASSOCIATED" not in probabilities:
+                raise ValueError("Binary malware probability is missing.")
+            mal_prob = float(probabilities["MALWARE_ASSOCIATED"])
             is_malware = mal_prob >= self.detection_threshold
             status = "MALWARE_ASSOCIATED" if is_malware else "BENIGN"
 
             multi_label = "N/A"
             multi_conf = 0.0
             if is_malware:
+                stage = "multiclass_inference"
                 m_res = self.predictor.predict_flow(feat_dict, mode="multiclass")
                 multi_label = m_res["label"]
                 multi_conf = m_res["confidence"]
@@ -483,6 +550,13 @@ class IngestionEngine:
             # RANSOMWARE, ADWARE, SCAREWARE, SMSMALWARE. Never label BENIGN as threats.
             VALID_THREAT_FAMILIES = {"RANSOMWARE", "ADWARE", "SCAREWARE", "SMSMALWARE"}
             is_threat = bool(is_malware and multi_label in VALID_THREAT_FAMILIES and multi_label != "BENIGN")
+            decision = (
+                "ALERT_STORED"
+                if is_threat
+                else "BELOW_THRESHOLD"
+                if not is_malware
+                else "UNSUPPORTED_FAMILY"
+            )
 
             flow_record = {
                 "id": f"{key[0]}_{key[2]}_{key[1]}_{key[3]}_{key[4]}_{int(flow.start_time * 1000)}",
@@ -498,39 +572,48 @@ class IngestionEngine:
                 "is_threat": is_threat,
                 "detection_source": "ML_MODEL",
                 "event_type": "ML_THREAT_ALERT" if is_threat else "NORMAL_FLOW",
+                "binary_predicted_class": bin_res["label"],
                 "malware_probability": round(mal_prob, 4),
                 "binary_confidence": round(bin_res["confidence"], 4),
                 "multiclass_category": multi_label,
                 "multiclass_confidence": round(multi_conf, 4),
                 "latency_ms": round(lat_ms, 2),
+                "decision": decision,
                 "evidence_type": "Pattern Resemblance (ML)",
                 "note": "Indicates structural similarity to learned training signatures, not active device breach."
             }
 
             with self.lock:
+                diagnostic = self.inference_diagnostics
+                diagnostic["predictions_succeeded"] += 1
+                diagnostic["recent_predictions"].insert(0, {
+                    "timestamp": flow_record["timestamp"],
+                    "binary_predicted_class": flow_record["binary_predicted_class"],
+                    "malware_probability": flow_record["malware_probability"],
+                    "multiclass_predicted_class": multi_label,
+                    "multiclass_confidence": round(multi_conf, 4),
+                    "decision": decision,
+                })
+                del diagnostic["recent_predictions"][20:]
                 self.recent_flows.insert(0, flow_record)
                 if len(self.recent_flows) > 100:
                     self.recent_flows.pop()
 
                 if is_threat:
                     self.alerts.insert(0, flow_record)
+                    diagnostic["alerts_stored"] += 1
                     if len(self.alerts) > 50:
                         self.alerts.pop()
-        except Exception as e:
+                elif not is_malware:
+                    diagnostic["alerts_rejected_threshold"] += 1
+                else:
+                    diagnostic["alerts_rejected_class_mapping"] += 1
+        except Exception as exc:
             # Handle unclassified or truncated flows
             with self.lock:
-                self.recent_flows.insert(0, {
-                    "timestamp": time.strftime("%H:%M:%S"),
-                    "src_ip": key[0],
-                    "dst_ip": key[1],
-                    "src_port": key[2],
-                    "dst_port": key[3],
-                    "protocol": str(key[4]),
-                    "packets": flow.fwd_packets + flow.bwd_packets,
-                    "bytes": sum(flow.fwd_lengths) + sum(flow.bwd_lengths),
-                    "status": "NOT_CLASSIFIED",
-                    "reason": f"Incompatible feature schema or extraction error: {e}"
-                })
+                self._record_classification_failure(
+                    key, flow, stage, type(exc).__name__
+                )
 
 
 
@@ -606,6 +689,13 @@ def get_telemetry():
             "alerts": list(engine.alerts[:25]),
             "detection_threshold": engine.detection_threshold,
             "ml_alerts_count": len(engine.alerts),
+            "inference_diagnostics": {
+                **engine.inference_diagnostics,
+                "packets_received": engine.total_packets_received,
+                "recent_predictions": list(
+                    engine.inference_diagnostics["recent_predictions"]
+                ),
+            },
             "is_pcap_recording": engine.pcap_recorder is not None,
             "current_pcap_path": engine.current_pcap_path
         }

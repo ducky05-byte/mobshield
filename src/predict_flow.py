@@ -159,14 +159,27 @@ class FlowPredictor:
             probs = self.binary_model.predict_proba(X_scaled)[0] if hasattr(self.binary_model, "predict_proba") else None
             
             label_name = self.binary_classes.get(int(pred), f"Class_{pred}")
-            conf = float(probs[int(pred)]) if probs is not None else 1.0
+            probabilities = {}
+            if probs is not None:
+                class_ids = getattr(self.binary_model, "classes_", None)
+                if class_ids is None:
+                    class_ids = range(len(probs))
+                if len(class_ids) != len(probs):
+                    raise RuntimeError(
+                        "Binary model class order does not match its probability output."
+                    )
+                probabilities = {
+                    self.binary_classes.get(int(class_id), f"Class_{class_id}"): float(probability)
+                    for class_id, probability in zip(class_ids, probs)
+                }
+            conf = probabilities.get(label_name, 1.0)
 
             return {
                 "mode": "binary",
                 "prediction": int(pred),
                 "label": label_name,
                 "confidence": round(conf, 4),
-                "probabilities": {self.binary_classes.get(i, f"Class_{i}"): round(float(p), 4) for i, p in enumerate(probs)} if probs is not None else {}
+                "probabilities": {label: round(probability, 4) for label, probability in probabilities.items()}
             }
 
         elif mode == "multiclass":
@@ -176,14 +189,27 @@ class FlowPredictor:
             probs = self.multiclass_model.predict_proba(X_scaled)[0] if hasattr(self.multiclass_model, "predict_proba") else None
 
             label_name = self.multiclass_classes.get(int(pred), f"Class_{pred}")
-            conf = float(probs[int(pred)]) if probs is not None else 1.0
+            probabilities = {}
+            if probs is not None:
+                class_ids = getattr(self.multiclass_model, "classes_", None)
+                if class_ids is None:
+                    class_ids = range(len(probs))
+                if len(class_ids) != len(probs):
+                    raise RuntimeError(
+                        "Multiclass model class order does not match its probability output."
+                    )
+                probabilities = {
+                    self.multiclass_classes.get(int(class_id), f"Class_{class_id}"): float(probability)
+                    for class_id, probability in zip(class_ids, probs)
+                }
+            conf = probabilities.get(label_name, 1.0)
 
             return {
                 "mode": "multiclass",
                 "prediction": int(pred),
                 "label": label_name,
                 "confidence": round(conf, 4),
-                "probabilities": {self.multiclass_classes.get(i, f"Class_{i}"): round(float(p), 4) for i, p in enumerate(probs)} if probs is not None else {}
+                "probabilities": {label: round(probability, 4) for label, probability in probabilities.items()}
             }
         else:
             raise ValueError(f"Unsupported mode: {mode}. Must be 'binary' or 'multiclass'.")

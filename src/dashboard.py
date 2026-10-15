@@ -57,10 +57,9 @@ from src.predict_flow import FlowPredictor
 
 import os
 
-API_BASE_URL = (
-    os.getenv("API_BASE_URL")
-    or _dashboard_dotenv.get("API_BASE_URL")
-    or "http://127.0.0.1:8000"
+API_BASE_URL = os.getenv(
+    "API_BASE_URL",
+    "https://holder-negotiations-provision-handy.trycloudflare.com"
 ).rstrip("/")
 ADMIN_API_TOKEN = (
     os.getenv("ADMIN_API_TOKEN")
@@ -538,7 +537,7 @@ def render_dashboard() -> None:
 
     # 3. Model Calibration (Cutoff Threshold)
     st.sidebar.markdown('<div class="sidebar-section-title">Threat Detection Cutoff</div>', unsafe_allow_html=True)
-    threshold = st.sidebar.slider(
+    selected_threshold = st.sidebar.slider(
         "Decision Cutoff",
         min_value=0.10,
         max_value=0.90,
@@ -547,12 +546,46 @@ def render_dashboard() -> None:
         label_visibility="collapsed",
         help="Probability cutoff for classifying flows as MALWARE_ASSOCIATED. Default is 0.65 (65%)."
     )
-    st.sidebar.markdown(f"<div style='font-size:0.8rem; color:#94a3b8; margin-top:-4px; margin-bottom:8px;'>Current threshold: <b style='color:#ffffff;'>{threshold:.2f}</b> ({int(round(threshold * 100))}%)</div>", unsafe_allow_html=True)
+    threshold = selected_threshold
+    if is_api_online:
+        backend_threshold = (
+            float(telemetry_data["detection_threshold"])
+            if telemetry_data and telemetry_data.get("detection_threshold") is not None
+            else None
+        )
+        if backend_threshold is None or backend_threshold != selected_threshold:
+            threshold_result = query_api(
+                f"/api/config/threshold?threshold={selected_threshold}",
+                method="POST",
+            )
+            if (
+                threshold_result
+                and threshold_result.get("status") == "UPDATED"
+                and threshold_result.get("threshold") is not None
+            ):
+                backend_threshold = float(threshold_result["threshold"])
+            elif backend_threshold is not None:
+                st.sidebar.warning(
+                    "The backend cutoff was not updated; the dashboard is using "
+                    f"the current backend value ({backend_threshold:.2f})."
+                )
+            else:
+                backend_threshold = st.session_state.get("last_synced_threshold")
+                st.sidebar.warning(
+                    "The backend cutoff could not be verified; the dashboard is "
+                    "using its last confirmed value."
+                )
+        if backend_threshold is not None:
+            threshold = float(backend_threshold)
+            st.session_state.last_synced_threshold = threshold
 
-    # Sync threshold with backend if changed
-    if st.session_state.get("last_synced_threshold") != threshold:
-        query_api(f"/api/config/threshold?threshold={threshold}", method="POST")
-        st.session_state.last_synced_threshold = threshold
+    cutoff_label = "Effective backend cutoff" if is_api_online else "Effective local cutoff"
+    st.sidebar.markdown(
+        f"<div style='font-size:0.8rem; color:#94a3b8; margin-top:-4px; margin-bottom:8px;'>"
+        f"{cutoff_label}: <b style='color:#ffffff;'>{threshold:.2f}</b> "
+        f"({int(round(threshold * 100))}%)</div>",
+        unsafe_allow_html=True,
+    )
 
     # 6. Diagnostics & Benchmark Verification
     st.sidebar.markdown('<div class="sidebar-section-title">Diagnostics & Telemetry</div>', unsafe_allow_html=True)
@@ -1012,6 +1045,79 @@ def render_dashboard() -> None:
 
     # ----------------- TAB 5: SYSTEM DIAGNOSTICS -----------------
     with tab_diag:
+        inference_diagnostics = (
+            telemetry_data.get("inference_diagnostics", {})
+            if telemetry_data
+            else {}
+        )
+        st.markdown(
+            '<div class="sidebar-section-title">Threat-Detection Pipeline</div>',
+            unsafe_allow_html=True,
+        )
+        diagnostic_columns = st.columns(4)
+        diagnostic_metrics = (
+            ("Packets received", inference_diagnostics.get("packets_received", 0)),
+            (
+                "Flows submitted",
+                inference_diagnostics.get("flows_submitted_for_inference", 0),
+            ),
+            (
+                "Predictions succeeded",
+                inference_diagnostics.get("predictions_succeeded", 0),
+            ),
+            (
+                "Predictions failed",
+                inference_diagnostics.get("predictions_failed", 0),
+            ),
+            (
+                "Rejected by threshold",
+                inference_diagnostics.get("alerts_rejected_threshold", 0),
+            ),
+            (
+                "Rejected by class",
+                inference_diagnostics.get("alerts_rejected_class_mapping", 0),
+            ),
+            ("Alerts stored", inference_diagnostics.get("alerts_stored", 0)),
+            (
+                "Feature errors",
+                inference_diagnostics.get("feature_extraction_failures", 0),
+            ),
+        )
+        for index, (label, value) in enumerate(diagnostic_metrics):
+            with diagnostic_columns[index % len(diagnostic_columns)]:
+                st.metric(label, value)
+
+        last_pipeline_error = inference_diagnostics.get("last_error")
+        if last_pipeline_error:
+            st.warning(
+                "Last pipeline error: "
+                f"{last_pipeline_error.get('stage', 'unknown stage')} "
+                f"({last_pipeline_error.get('error_type', 'unknown error')})"
+            )
+
+        recent_predictions = inference_diagnostics.get("recent_predictions", [])
+        if recent_predictions:
+            prediction_columns = (
+                "timestamp",
+                "binary_predicted_class",
+                "malware_probability",
+                "multiclass_predicted_class",
+                "multiclass_confidence",
+                "decision",
+                "stage",
+                "error_type",
+            )
+            st.dataframe(
+                [
+                    {column: record.get(column) for column in prediction_columns}
+                    for record in recent_predictions
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.caption("No flow predictions have been recorded yet.")
+
         diag_c1, diag_c2 = st.columns(2)
     
         with diag_c1:

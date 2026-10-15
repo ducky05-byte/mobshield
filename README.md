@@ -378,8 +378,12 @@ back to fabricated predictions.
 To verify a deployment, wait for Railway's backend health check at
 `/api/status`, then pair the Android companion and submit live VPN packets.
 After a flow finalizes, inspect `/api/telemetry` for its ML classification and
-probabilities. This confirms actual inference on captured flow data; a health
-check alone confirms only that the API process started. Check startup logs for
+probabilities and the `inference_diagnostics` object for packet, finalized-flow,
+inference, threshold/class-rejection, and alert-storage counts. It also provides
+recent class/probability decisions and sanitized error stage/type without
+including packet contents or flow identifiers. This confirms actual inference
+on captured flow data; a health check alone confirms only that the API process
+started. Check startup logs for
 successful service startup, but do not log or share the presigned URL or
 Bearer token. A local Docker build can be run with
 `docker build -t mobileshield-backend .`; it no longer requires a local
