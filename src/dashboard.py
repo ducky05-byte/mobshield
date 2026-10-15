@@ -429,9 +429,454 @@ def _refresh_setting_changed() -> None:
     st.rerun(scope="app")
 
 
+def _get_active_threat_alerts(
+    telemetry_data: Optional[Dict[str, Any]], threshold: float
+) -> List[Dict[str, Any]]:
+    raw_alerts = telemetry_data.get("alerts", []) if telemetry_data else []
+    if not telemetry_data and st.session_state.data_mode == "DIAGNOSTIC":
+        raw_alerts = [
+            flow
+            for flow in st.session_state.diagnostic_history
+            if flow.get("is_threat", False)
+            or (
+                flow.get("status") == "MALWARE_ASSOCIATED"
+                and flow.get("multiclass_category")
+                in {"RANSOMWARE", "ADWARE", "SCAREWARE", "SMSMALWARE"}
+            )
+        ]
+
+    valid_families = {"RANSOMWARE", "ADWARE", "SCAREWARE", "SMSMALWARE"}
+    active_alerts = []
+    seen_signatures = set()
+    for alert in raw_alerts:
+        probability = float(alert.get("malware_probability", 0.0))
+        category = str(alert.get("multiclass_category", "Unknown")).upper()
+        if probability < threshold or category not in valid_families:
+            continue
+
+        signature = alert.get("id") or (
+            f"{alert.get('timestamp')}_{alert.get('src_ip')}:{alert.get('src_port')}_"
+            f"{alert.get('dst_ip')}:{alert.get('dst_port')}_"
+            f"{alert.get('protocol')}_{category}"
+        )
+        if signature not in seen_signatures:
+            seen_signatures.add(signature)
+            alert_copy = dict(alert)
+            alert_copy["detection_source"] = alert.get("detection_source", "ML_MODEL")
+            active_alerts.append(alert_copy)
+    return active_alerts
+
+
 @st.fragment(run_every=1 if auto_refresh_enabled else None)
+def render_live_metrics(threshold: float) -> None:
+    """Refresh capture status and summary metrics without rerunning other UI."""
+    api_status = query_api("/api/status")
+    telemetry_data = query_api("/api/telemetry")
+    is_api_online = telemetry_data is not None
+    is_streaming = api_status.get("is_streaming", False) if api_status else False
+    is_pcap_recording = api_status.get("pcap_recording", False) if api_status else False
+    target_device = st.session_state.get("dashboard_target_device")
+    relay_stale = st.session_state.get("dashboard_relay_stale", True)
+
+    backend_badge = (
+        '<span class="status-pill pill-online">Backend Online</span>'
+        if is_api_online
+        else '<span class="status-pill pill-offline">Backend Offline</span>'
+    )
+    device_str = target_device.get("model", "None") if target_device else "None"
+    if target_device and not relay_stale:
+        device_badge = f'<span class="status-pill pill-active">Device: {device_str}</span>'
+    elif target_device and relay_stale:
+        device_badge = f'<span class="status-pill pill-idle">Device: {device_str} (stale)</span>'
+    else:
+        device_badge = '<span class="status-pill pill-idle">Device: Disconnected</span>'
+    capture_badge = (
+        '<span class="status-pill pill-online">Capture: Streaming</span>'
+        if is_streaming
+        else '<span class="status-pill pill-idle">Capture: Standby</span>'
+    )
+    pcap_badge = (
+        '<span class="status-pill pill-threat">PCAP: Recording</span>'
+        if is_pcap_recording
+        else '<span class="status-pill pill-idle">PCAP: Standby</span>'
+    )
+    st.markdown(
+        f"""
+        <div class="status-bar-container">
+            {backend_badge}
+            {device_badge}
+            {capture_badge}
+            {pcap_badge}
+            <span style="margin-left:auto; color:#64748b; font-size:0.75rem;">Endpoint: 127.0.0.1:8000 &bull; Tunnel: adb reverse tcp:8000</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    total_packets = telemetry_data.get("total_packets", 0) if telemetry_data else 0
+    total_bytes = telemetry_data.get("total_bytes", 0) if telemetry_data else 0
+    active_flows = telemetry_data.get("active_flows", 0) if telemetry_data else 0
+    if not is_api_online and st.session_state.data_mode == "DIAGNOSTIC":
+        flows = st.session_state.diagnostic_history
+        total_packets = sum(flow.get("packets", 0) for flow in flows)
+        total_bytes = sum(flow.get("bytes", 0) for flow in flows)
+    active_alerts = _get_active_threat_alerts(telemetry_data, threshold)
+    volume = (
+        f"{total_bytes / (1024 * 1024):.2f} MB"
+        if total_bytes > 1024 * 1024
+        else f"{total_bytes / 1024:.1f} KB"
+    )
+
+    metric_columns = st.columns(4)
+    metrics = (
+        ("Packets Captured", f"{total_packets:,}", "Raw Layer 3/4 frames"),
+        ("Traffic Volume", volume, "Ingested bytes"),
+        ("Active Flows", str(active_flows), "In aggregation buffer"),
+        ("ML Threat Alerts", str(len(active_alerts)), f"Model Cutoff >= {threshold:.2f}"),
+    )
+    for column, (label, value, hint) in zip(metric_columns, metrics):
+        with column:
+            st.markdown(
+                f"""
+                <div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{value}</div>
+                    <div class="metric-hint">{hint}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+@st.fragment(run_every=1 if auto_refresh_enabled else None)
+def render_live_packets() -> None:
+    """Refresh only the packet table while preserving its filter controls."""
+    telemetry_data = query_api("/api/telemetry")
+    recent_packets = telemetry_data.get("recent_packets", []) if telemetry_data else []
+
+    filter_columns = st.columns([2, 3, 2])
+    with filter_columns[0]:
+        protocol_filter = st.selectbox(
+            "Protocol Filter", options=["All", "TCP", "UDP", "DNS", "ICMP"], index=0
+        )
+    with filter_columns[1]:
+        search_filter = st.text_input(
+            "Filter Address / Port", placeholder="Search IP or Port..."
+        )
+    with filter_columns[2]:
+        max_rows = st.selectbox("Display Limit", options=[25, 50, 100], index=1)
+
+    filtered_packets = []
+    for packet in recent_packets:
+        protocol = str(packet.get("protocol", "")).upper()
+        if protocol_filter != "All" and protocol != protocol_filter:
+            continue
+        if search_filter:
+            needle = search_filter.lower()
+            source = f"{packet.get('src_ip', '')}:{packet.get('src_port', '')}".lower()
+            destination = f"{packet.get('dst_ip', '')}:{packet.get('dst_port', '')}".lower()
+            if needle not in source and needle not in destination:
+                continue
+        filtered_packets.append(packet)
+
+    if not filtered_packets:
+        st.markdown(
+            """
+            <div class="context-panel" style="border-left-color: #64748b;">
+                <b>No packets matching criteria.</b><br/>
+                Start capture in the MobileShield companion app on your connected device, browse web traffic, or trigger a diagnostic flow.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    now = time.time()
+    packet_sequences = [
+        int(packet["seq"])
+        for packet in recent_packets
+        if packet.get("seq") is not None
+    ]
+    current_max_seq = max(packet_sequences, default=0)
+
+    if not st.session_state.initial_packet_sync_done:
+        st.session_state.max_rendered_packet_seq = current_max_seq
+        st.session_state.initial_packet_sync_done = True
+    elif current_max_seq < st.session_state.max_rendered_packet_seq:
+        st.session_state.max_rendered_packet_seq = current_max_seq
+        st.session_state.rendered_packets_seen.clear()
+    else:
+        previous_max_seq = st.session_state.max_rendered_packet_seq
+        for packet in recent_packets:
+            sequence = packet.get("seq")
+            if sequence is not None and int(sequence) > previous_max_seq:
+                packet_id = packet.get("id") or (
+                    f"pkt_{sequence}_{packet.get('raw_timestamp', packet.get('timestamp'))}"
+                )
+                st.session_state.rendered_packets_seen[packet_id] = now
+        st.session_state.max_rendered_packet_seq = current_max_seq
+
+    st.session_state.rendered_packets_seen = {
+        packet_id: first_seen
+        for packet_id, first_seen in st.session_state.rendered_packets_seen.items()
+        if now - first_seen < 2.6
+    }
+
+    rows_html = []
+    for packet in filtered_packets[:max_rows]:
+        packet_id = packet.get("id") or (
+            f"pkt_{packet.get('seq', 0)}_"
+            f"{packet.get('raw_timestamp', packet.get('timestamp'))}"
+        )
+        first_seen = st.session_state.rendered_packets_seen.get(packet_id)
+        highlight_age = now - first_seen if first_seen is not None else 999.0
+        if highlight_age < 2.6:
+            row_class = "pkt-row-new"
+            animation_style = f"style=\"animation-delay: -{max(0.0, highlight_age):.2f}s;\""
+            badge_html = '<span class="pkt-badge-new">NEW</span>'
+        else:
+            row_class = "pkt-row-normal"
+            animation_style = ""
+            badge_html = ""
+
+        protocol = str(packet.get("protocol", "TCP")).upper()
+        if protocol == "TCP":
+            protocol_badge = (
+                f'<span class="pkt-proto-pill pkt-proto-tcp">{html.escape(protocol)}</span>'
+            )
+        elif protocol in ("UDP", "DNS"):
+            protocol_badge = (
+                f'<span class="pkt-proto-pill pkt-proto-udp">{html.escape(protocol)}</span>'
+            )
+        else:
+            protocol_badge = (
+                f'<span class="pkt-proto-pill pkt-proto-other">{html.escape(protocol)}</span>'
+            )
+
+        sequence = html.escape(str(packet.get("seq", "-")))
+        source = html.escape(f"{packet.get('src_ip')}:{packet.get('src_port')}")
+        destination = html.escape(f"{packet.get('dst_ip')}:{packet.get('dst_port')}")
+        timestamp = html.escape(str(packet.get("timestamp", "--:--:--")))
+        length = packet.get("length", 0)
+        length_display = (
+            f"{length:,} B"
+            if isinstance(length, (int, float))
+            else html.escape(str(length))
+        )
+        flags = html.escape(str(packet.get("flags") or "-"))
+        app = html.escape(str(packet.get("app") or "com.android.system"))
+        rows_html.append(
+            f"""<tr class="{row_class}" {animation_style}>
+                <td style="color:#94a3b8; font-size:0.75rem;">{badge_html}#{sequence}</td>
+                <td>{timestamp}</td>
+                <td>{source}</td>
+                <td>{destination}</td>
+                <td>{protocol_badge}</td>
+                <td>{length_display}</td>
+                <td style="color:#94a3b8;">{flags}</td>
+                <td style="color:#94a3b8; max-width:200px; overflow:hidden; text-overflow:ellipsis;" title="{app}">{app}</td>
+            </tr>"""
+        )
+
+    st.markdown(
+        f"""<div class="pkt-table-wrap">
+            <table class="pkt-table">
+                <thead><tr>
+                    <th style="width: 85px;">Seq</th>
+                    <th style="width: 90px;">Time</th>
+                    <th>Source</th><th>Destination</th>
+                    <th style="width: 80px;">Proto</th>
+                    <th style="width: 95px;">Length</th>
+                    <th style="width: 85px;">Flags</th><th>Application</th>
+                </tr></thead>
+                <tbody>{''.join(rows_html)}</tbody>
+            </table>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Newly captured packets highlight ruby red briefly to indicate packet "
+        "arrival only; this is independent of ML threat detection."
+    )
+
+
+@st.fragment(run_every=1 if auto_refresh_enabled else None)
+def render_live_flows(threshold: float) -> None:
+    """Refresh the completed-flow table without rerunning the rest of the page."""
+    telemetry_data = query_api("/api/telemetry")
+    recent_flows = telemetry_data.get("recent_flows", []) if telemetry_data else []
+    if not telemetry_data and st.session_state.data_mode == "DIAGNOSTIC":
+        recent_flows = st.session_state.diagnostic_history
+
+    st.markdown(
+        """
+        <div class="context-panel">
+            <b>Bidirectional Flow Aggregation:</b> Packets are correlated into 5-tuple sessions (Source IP, Source Port, Destination IP, Destination Port, Protocol)
+            and aligned to the 65-feature schema required by the Random Forest model. Unfinished or incompatible flows are designated <code>NOT_CLASSIFIED</code>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not recent_flows:
+        st.markdown(
+            """
+            <div class="context-panel" style="border-left-color: #64748b;">
+                <b>No completed network flows.</b> Flows finalize upon active timeout or inactivity timeout.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    flow_table = []
+    for flow in recent_flows[:50]:
+        status = flow.get("status", "BENIGN")
+        probability = flow.get("malware_probability", 0.0)
+        probability_display = f"{probability * 100:.1f}%"
+        confidence = flow.get("binary_confidence", max(probability, 1.0 - probability))
+        if status == "MALWARE_ASSOCIATED":
+            status_display = f"MALWARE ({probability_display})"
+        elif status == "NOT_CLASSIFIED":
+            status_display = "NOT_CLASSIFIED"
+        elif 0.40 <= probability < threshold:
+            status_display = f"UNCERTAIN ({probability_display})"
+        else:
+            status_display = f"BENIGN ({100.0 - probability * 100:.1f}%)"
+
+        category = flow.get("multiclass_category", "N/A")
+        if category != "N/A" and category != "Unknown":
+            category = f"{category} ({flow.get('multiclass_confidence', 0.0) * 100:.1f}%)"
+        flow_table.append(
+            {
+                "Timestamp": flow.get("timestamp"),
+                "Source": f"{flow.get('src_ip')}:{flow.get('src_port')}",
+                "Destination": f"{flow.get('dst_ip')}:{flow.get('dst_port')}",
+                "Proto": flow.get("protocol"),
+                "Packets": flow.get("packets"),
+                "Volume (Bytes)": f"{flow.get('bytes', 0):,}",
+                "Classification": status_display,
+                "Confidence": f"{confidence * 100:.1f}%",
+                "Family": category,
+                "Latency": f"{flow.get('latency_ms', 0):.1f} ms",
+            }
+        )
+    st.dataframe(flow_table, width="stretch", hide_index=True)
+
+
+@st.fragment(run_every=1 if auto_refresh_enabled else None)
+def render_live_threat_alerts(threshold: float) -> None:
+    """Refresh detailed threat results while keeping alert records unchanged."""
+    telemetry_data = query_api("/api/telemetry")
+    active_alerts = _get_active_threat_alerts(telemetry_data, threshold)
+    st.markdown(
+        f"""
+        <div class="context-panel">
+            <b>ML Classification Interpretation:</b> Independent machine learning inferences generated by the 65-feature flow classifier.
+            Threat alerts require both binary malware probability &ge; {threshold:.2f} and a predicted family in the supported malware taxonomy
+            (RANSOMWARE, ADWARE, SCAREWARE, SMSMALWARE). BENIGN predictions never trigger alerts. This represents statistical pattern resemblance, not confirmed infection.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not active_alerts:
+        st.markdown(
+            f"""
+            <div class="context-panel" style="border-left-color: #059669;">
+                <b>No ML threat alerts recorded.</b> All inspected network flows conform to baseline benign behavior or fall below the decision cutoff threshold ({threshold:.2f}).
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.caption(
+        f"{len(active_alerts)} deduplicated flow(s) flagged by ML model above "
+        f"cutoff ({threshold:.2f}):"
+    )
+    alert_table = []
+    for alert in active_alerts:
+        alert_table.append(
+            {
+                "Timestamp": alert.get("timestamp"),
+                "Source": f"{alert.get('src_ip')}:{alert.get('src_port')}",
+                "Destination": f"{alert.get('dst_ip')}:{alert.get('dst_port')}",
+                "Protocol": alert.get("protocol"),
+                "Packets": alert.get("packets"),
+                "Volume (Bytes)": f"{alert.get('bytes', 0):,}",
+                "Malware Probability": (
+                    f"{float(alert.get('malware_probability', 0.0)) * 100:.1f}%"
+                ),
+                "Multiclass Confidence": (
+                    f"{float(alert.get('multiclass_confidence', 0.0)) * 100:.1f}%"
+                ),
+                "Predicted Family": alert.get("multiclass_category", "Unknown"),
+                "Detection Source": alert.get("detection_source", "ML_MODEL"),
+                "Assessment Note": alert.get("note", "Structural pattern similarity"),
+            }
+        )
+    st.dataframe(alert_table, width="stretch", hide_index=True)
+
+
+@st.fragment(run_every=1 if auto_refresh_enabled else None)
+def render_live_pipeline_diagnostics() -> None:
+    """Refresh inference counters without refreshing the hardware diagnostics."""
+    telemetry_data = query_api("/api/telemetry")
+    diagnostics = (
+        telemetry_data.get("inference_diagnostics", {}) if telemetry_data else {}
+    )
+    st.markdown(
+        '<div class="sidebar-section-title">Threat-Detection Pipeline</div>',
+        unsafe_allow_html=True,
+    )
+    diagnostic_columns = st.columns(4)
+    diagnostic_metrics = (
+        ("Packets received", diagnostics.get("packets_received", 0)),
+        ("Flows submitted", diagnostics.get("flows_submitted_for_inference", 0)),
+        ("Predictions succeeded", diagnostics.get("predictions_succeeded", 0)),
+        ("Predictions failed", diagnostics.get("predictions_failed", 0)),
+        ("Rejected by threshold", diagnostics.get("alerts_rejected_threshold", 0)),
+        ("Rejected by class", diagnostics.get("alerts_rejected_class_mapping", 0)),
+        ("Alerts stored", diagnostics.get("alerts_stored", 0)),
+        ("Feature errors", diagnostics.get("feature_extraction_failures", 0)),
+    )
+    for index, (label, value) in enumerate(diagnostic_metrics):
+        with diagnostic_columns[index % len(diagnostic_columns)]:
+            st.metric(label, value)
+
+    last_error = diagnostics.get("last_error")
+    if last_error:
+        st.warning(
+            "Last pipeline error: "
+            f"{last_error.get('stage', 'unknown stage')} "
+            f"({last_error.get('error_type', 'unknown error')})"
+        )
+
+    recent_predictions = diagnostics.get("recent_predictions", [])
+    if recent_predictions:
+        prediction_columns = (
+            "timestamp",
+            "binary_predicted_class",
+            "malware_probability",
+            "multiclass_predicted_class",
+            "multiclass_confidence",
+            "decision",
+            "stage",
+            "error_type",
+        )
+        st.dataframe(
+            [
+                {column: record.get(column) for column in prediction_columns}
+                for record in recent_predictions
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("No flow predictions have been recorded yet.")
+
+
 def render_dashboard() -> None:
-    """Refresh live dashboard content without rerunning the whole page."""
+    """Render stable controls and isolate live data in small fragments."""
 
 
 # ----------------- DATA INGESTION STATE -----------------
@@ -666,97 +1111,9 @@ def render_dashboard() -> None:
             on_change=_refresh_setting_changed,
         )
 
-    # Build compact status bar
-    backend_badge = '<span class="status-pill pill-online">Backend Online</span>' if is_api_online else '<span class="status-pill pill-offline">Backend Offline</span>'
-    device_str = target_device.get("model", "None") if target_device else "None"
-    if target_device and not relay_stale:
-        device_badge = f'<span class="status-pill pill-active">Device: {device_str}</span>'
-    elif target_device and relay_stale:
-        device_badge = f'<span class="status-pill pill-idle">Device: {device_str} (stale)</span>'
-    else:
-        device_badge = '<span class="status-pill pill-idle">Device: Disconnected</span>'
-    capture_badge = '<span class="status-pill pill-online">Capture: Streaming</span>' if is_streaming else '<span class="status-pill pill-idle">Capture: Standby</span>'
-    pcap_badge = '<span class="status-pill pill-threat">PCAP: Recording</span>' if is_pcap_recording else '<span class="status-pill pill-idle">PCAP: Standby</span>'
-
-    st.markdown(f"""
-    <div class="status-bar-container">
-        {backend_badge}
-        {device_badge}
-        {capture_badge}
-        {pcap_badge}
-        <span style="margin-left:auto; color:#64748b; font-size:0.75rem;">Endpoint: 127.0.0.1:8000 &bull; Tunnel: adb reverse tcp:8000</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ----------------- COMPACT METRIC CARDS & ALERT INGESTION -----------------
-    tot_packets = telemetry_data.get("total_packets", 0) if telemetry_data else 0
-    tot_bytes = telemetry_data.get("total_bytes", 0) if telemetry_data else 0
-    act_flows = telemetry_data.get("active_flows", 0) if telemetry_data else 0
-    rec_flows = telemetry_data.get("recent_flows", []) if telemetry_data else []
-    raw_alerts = telemetry_data.get("alerts", []) if telemetry_data else []
-
-    if not is_api_online:
-        if st.session_state.data_mode == "DIAGNOSTIC":
-            rec_flows = st.session_state.diagnostic_history
-            raw_alerts = [f for f in rec_flows if f.get("is_threat", False) or (f.get("status") == "MALWARE_ASSOCIATED" and f.get("multiclass_category") in {"RANSOMWARE", "ADWARE", "SCAREWARE", "SMSMALWARE"})]
-            tot_packets = sum(f.get("packets", 0) for f in rec_flows)
-            tot_bytes = sum(f.get("bytes", 0) for f in rec_flows)
-
-    # Threat Alert Filtering & Deduplication (Policy: Probability >= threshold AND supported malware family):
-    VALID_THREAT_FAMILIES = {"RANSOMWARE", "ADWARE", "SCAREWARE", "SMSMALWARE"}
-    active_threat_alerts = []
-    seen_alert_sigs = set()
-
-    for a in raw_alerts:
-        prob = float(a.get("malware_probability", 0.0))
-        cat = str(a.get("multiclass_category", "Unknown")).upper()
-        # ML Alert Policy: prob >= threshold AND supported family AND NOT BENIGN
-        if prob >= threshold and cat in VALID_THREAT_FAMILIES and cat != "BENIGN":
-            alert_sig = a.get("id") or f"{a.get('timestamp')}_{a.get('src_ip')}:{a.get('src_port')}_{a.get('dst_ip')}:{a.get('dst_port')}_{a.get('protocol')}_{cat}"
-            if alert_sig not in seen_alert_sigs:
-                seen_alert_sigs.add(alert_sig)
-                a_copy = dict(a)
-                a_copy["detection_source"] = a.get("detection_source", "ML_MODEL")
-                active_threat_alerts.append(a_copy)
-
-    vol_str = f"{tot_bytes / (1024*1024):.2f} MB" if tot_bytes > 1024*1024 else f"{tot_bytes / 1024:.1f} KB"
-
-    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    with m_col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Packets Captured</div>
-            <div class="metric-value">{tot_packets:,}</div>
-            <div class="metric-hint">Raw Layer 3/4 frames</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m_col2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Traffic Volume</div>
-            <div class="metric-value">{vol_str}</div>
-            <div class="metric-hint">Ingested bytes</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m_col3:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Active Flows</div>
-            <div class="metric-value">{act_flows}</div>
-            <div class="metric-hint">In aggregation buffer</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m_col4:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">ML Threat Alerts</div>
-            <div class="metric-value">{len(active_threat_alerts)}</div>
-            <div class="metric-hint">Model Cutoff &ge; {threshold:.2f}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    st.session_state.dashboard_target_device = target_device
+    st.session_state.dashboard_relay_stale = relay_stale
+    render_live_metrics(threshold)
 
     st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
 
@@ -771,220 +1128,15 @@ def render_dashboard() -> None:
 
     # ----------------- TAB 1: LIVE PACKET STREAM -----------------
     with tab_packets:
-        recent_pkts = telemetry_data.get("recent_packets", []) if telemetry_data else []
-    
-        col_filter1, col_filter2, col_filter3 = st.columns([2, 3, 2])
-        with col_filter1:
-            proto_filter = st.selectbox("Protocol Filter", options=["All", "TCP", "UDP", "DNS", "ICMP"], index=0)
-        with col_filter2:
-            search_filter = st.text_input("Filter Address / Port", placeholder="Search IP or Port...")
-        with col_filter3:
-            max_rows = st.selectbox("Display Limit", options=[25, 50, 100], index=1)
-        
-        filtered_pkts = []
-        for p in recent_pkts:
-            proto_str = str(p.get("protocol", "")).upper()
-            if proto_filter != "All" and proto_str != proto_filter:
-                continue
-            if search_filter:
-                needle = search_filter.lower()
-                src = f"{p.get('src_ip', '')}:{p.get('src_port', '')}".lower()
-                dst = f"{p.get('dst_ip', '')}:{p.get('dst_port', '')}".lower()
-                if needle not in src and needle not in dst:
-                    continue
-            filtered_pkts.append(p)
-        
-        if not filtered_pkts:
-            st.markdown("""
-            <div class="context-panel" style="border-left-color: #64748b;">
-                <b>No packets matching criteria.</b><br/>
-                Start capture in the MobileShield companion app on your connected device, browse web traffic, or trigger a diagnostic flow.
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            now = time.time()
-
-            packet_sequences = [
-                int(packet["seq"])
-                for packet in recent_pkts
-                if packet.get("seq") is not None
-            ]
-            current_max_seq = max(packet_sequences, default=0)
-
-            if not st.session_state.initial_packet_sync_done:
-                st.session_state.max_rendered_packet_seq = current_max_seq
-                st.session_state.initial_packet_sync_done = True
-            elif current_max_seq < st.session_state.max_rendered_packet_seq:
-                st.session_state.max_rendered_packet_seq = current_max_seq
-                st.session_state.rendered_packets_seen.clear()
-            else:
-                previous_max_seq = st.session_state.max_rendered_packet_seq
-                for packet in recent_pkts:
-                    sequence = packet.get("seq")
-                    if sequence is not None and int(sequence) > previous_max_seq:
-                        packet_id = packet.get("id") or (
-                            f"pkt_{sequence}_{packet.get('raw_timestamp', packet.get('timestamp'))}"
-                        )
-                        st.session_state.rendered_packets_seen[packet_id] = now
-                st.session_state.max_rendered_packet_seq = current_max_seq
-
-            st.session_state.rendered_packets_seen = {
-                packet_id: first_seen
-                for packet_id, first_seen in st.session_state.rendered_packets_seen.items()
-                if now - first_seen < 2.6
-            }
-
-            rows_html = []
-            for p in filtered_pkts[:max_rows]:
-                pid = p.get("id") or f"pkt_{p.get('seq', 0)}_{p.get('raw_timestamp', p.get('timestamp'))}"
-                first_seen = st.session_state.rendered_packets_seen.get(pid)
-                highlight_age = now - first_seen if first_seen is not None else 999.0
-                is_new = highlight_age < 2.6
-
-                if is_new:
-                    row_cls = "pkt-row-new"
-                    delay_sec = max(0.0, highlight_age)
-                    anim_style = f"style=\"animation-delay: -{delay_sec:.2f}s;\""
-                    badge_html = '<span class="pkt-badge-new">NEW</span>'
-                else:
-                    row_cls = "pkt-row-normal"
-                    anim_style = ""
-                    badge_html = ""
-
-                proto_raw = str(p.get("protocol", "TCP")).upper()
-                if proto_raw == "TCP":
-                    proto_badge = f'<span class="pkt-proto-pill pkt-proto-tcp">{html.escape(proto_raw)}</span>'
-                elif proto_raw in ("UDP", "DNS"):
-                    proto_badge = f'<span class="pkt-proto-pill pkt-proto-udp">{html.escape(proto_raw)}</span>'
-                else:
-                    proto_badge = f'<span class="pkt-proto-pill pkt-proto-other">{html.escape(proto_raw)}</span>'
-
-                seq_num = html.escape(str(p.get("seq", "-")))
-                src_str = html.escape(f"{p.get('src_ip')}:{p.get('src_port')}")
-                dst_str = html.escape(f"{p.get('dst_ip')}:{p.get('dst_port')}")
-                ts_str = html.escape(str(p.get("timestamp", "--:--:--")))
-                len_val = p.get("length", 0)
-                len_str = f"{len_val:,} B" if isinstance(len_val, (int, float)) else html.escape(str(len_val))
-                flags_str = html.escape(str(p.get("flags") if p.get("flags") else "-"))
-                app_str = html.escape(str(p.get("app") if p.get("app") else "com.android.system"))
-
-                rows_html.append(f"""<tr class="{row_cls}" {anim_style}>
-                    <td style="color:#94a3b8; font-size:0.75rem;">{badge_html}#{seq_num}</td>
-                    <td>{ts_str}</td>
-                    <td>{src_str}</td>
-                    <td>{dst_str}</td>
-                    <td>{proto_badge}</td>
-                    <td>{len_str}</td>
-                    <td style="color:#94a3b8;">{flags_str}</td>
-                    <td style="color:#94a3b8; max-width:200px; overflow:hidden; text-overflow:ellipsis;" title="{app_str}">{app_str}</td>
-                </tr>""")
-
-            table_markup = f"""<div class="pkt-table-wrap">
-                <table class="pkt-table">
-                    <thead>
-                        <tr>
-                            <th style="width: 85px;">Seq</th>
-                            <th style="width: 90px;">Time</th>
-                            <th>Source</th>
-                            <th>Destination</th>
-                            <th style="width: 80px;">Proto</th>
-                            <th style="width: 95px;">Length</th>
-                            <th style="width: 85px;">Flags</th>
-                            <th>Application</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {''.join(rows_html)}
-                    </tbody>
-                </table>
-            </div>"""
-            st.markdown(table_markup, unsafe_allow_html=True)
-            st.caption("Event Separation (Packet Event vs Threat Alert): Newly captured Layer 3/4 packets highlight ruby red (#7f1d1d) for ~2.6s to indicate immediate ingestion. This signifies live packet arrival only, completely independent of ML classification, and does NOT mean malware was detected.")
+        render_live_packets()
 
     # ----------------- TAB 2: FLOW MONITORING -----------------
     with tab_flows:
-        st.markdown("""
-        <div class="context-panel">
-            <b>Bidirectional Flow Aggregation:</b> Packets are correlated into 5-tuple sessions (Source IP, Source Port, Destination IP, Destination Port, Protocol)
-            and aligned to the 65-feature schema required by the Random Forest model. Unfinished or incompatible flows are designated <code>NOT_CLASSIFIED</code>.
-        </div>
-        """, unsafe_allow_html=True)
-
-        if not rec_flows:
-            st.markdown("""
-            <div class="context-panel" style="border-left-color: #64748b;">
-                <b>No completed network flows.</b> Flows finalize upon active timeout (15s) or inactivity timeout (5s).
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            flow_table = []
-            for f in rec_flows[:50]:
-                status = f.get("status", "BENIGN")
-                prob = f.get("malware_probability", 0.0)
-                prob_str = f"{prob * 100:.1f}%"
-                conf = f.get("binary_confidence", max(prob, 1.0 - prob))
-
-                if status == "MALWARE_ASSOCIATED":
-                    status_display = f"MALWARE ({prob_str})"
-                elif status == "NOT_CLASSIFIED":
-                    status_display = "NOT_CLASSIFIED"
-                elif 0.40 <= prob < threshold:
-                    status_display = f"UNCERTAIN ({prob_str})"
-                else:
-                    status_display = f"BENIGN ({100.0 - prob * 100:.1f}%)"
-
-                multi_cat = f.get("multiclass_category", "N/A")
-                if multi_cat != "N/A" and multi_cat != "Unknown":
-                    multi_cat = f"{multi_cat} ({f.get('multiclass_confidence', 0.0)*100:.1f}%)"
-
-                flow_table.append({
-                    "Timestamp": f.get("timestamp"),
-                    "Source": f"{f.get('src_ip')}:{f.get('src_port')}",
-                    "Destination": f"{f.get('dst_ip')}:{f.get('dst_port')}",
-                    "Proto": f.get("protocol"),
-                    "Packets": f.get("packets"),
-                    "Volume (Bytes)": f"{f.get('bytes', 0):,}",
-                    "Classification": status_display,
-                    "Confidence": f"{conf*100:.1f}%",
-                    "Family": multi_cat,
-                    "Latency": f"{f.get('latency_ms', 0):.1f} ms"
-                })
-            st.dataframe(flow_table, width="stretch", hide_index=True)
+        render_live_flows(threshold)
 
     # ----------------- TAB 3: THREAT DETECTION -----------------
     with tab_alerts:
-        st.markdown(f"""
-        <div class="context-panel">
-            <b>ML Classification Interpretation:</b> Independent machine learning inferences generated by the 65-feature flow classifier.
-            Threat alerts require both binary malware probability &ge; {threshold:.2f} (65% default) and a predicted family in the supported malware taxonomy
-            (RANSOMWARE, ADWARE, SCAREWARE, SMSMALWARE). BENIGN predictions never trigger alerts. This represents statistical pattern resemblance, not confirmed infection.
-        </div>
-        """, unsafe_allow_html=True)
-
-        if not active_threat_alerts:
-            st.markdown(f"""
-            <div class="context-panel" style="border-left-color: #059669;">
-                <b>No ML threat alerts recorded.</b> All inspected network flows conform to baseline benign behavior or fall below the decision cutoff threshold ({threshold:.2f}).
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.caption(f"{len(active_threat_alerts)} deduplicated flow(s) flagged by ML model above cutoff ({threshold:.2f}):")
-            alert_table = []
-            for a in active_threat_alerts:
-                alert_table.append({
-                    "Timestamp": a.get("timestamp"),
-                    "Source": f"{a.get('src_ip')}:{a.get('src_port')}",
-                    "Destination": f"{a.get('dst_ip')}:{a.get('dst_port')}",
-                    "Protocol": a.get("protocol"),
-                    "Packets": a.get("packets"),
-                    "Volume (Bytes)": f"{a.get('bytes', 0):,}",
-                    "Malware Probability": f"{float(a.get('malware_probability', 0.0))*100:.1f}%",
-                    "Multiclass Confidence": f"{float(a.get('multiclass_confidence', 0.0))*100:.1f}%",
-                    "Predicted Family": a.get("multiclass_category", "Unknown"),
-                    "Detection Source": a.get("detection_source", "ML_MODEL"),
-                    "Assessment Note": a.get("note", "Structural pattern similarity")
-                })
-            st.dataframe(alert_table, width="stretch", hide_index=True)
+        render_live_threat_alerts(threshold)
 
 
     # ----------------- TAB 4: PACKET CAPTURE (PCAP) -----------------
@@ -1045,78 +1197,7 @@ def render_dashboard() -> None:
 
     # ----------------- TAB 5: SYSTEM DIAGNOSTICS -----------------
     with tab_diag:
-        inference_diagnostics = (
-            telemetry_data.get("inference_diagnostics", {})
-            if telemetry_data
-            else {}
-        )
-        st.markdown(
-            '<div class="sidebar-section-title">Threat-Detection Pipeline</div>',
-            unsafe_allow_html=True,
-        )
-        diagnostic_columns = st.columns(4)
-        diagnostic_metrics = (
-            ("Packets received", inference_diagnostics.get("packets_received", 0)),
-            (
-                "Flows submitted",
-                inference_diagnostics.get("flows_submitted_for_inference", 0),
-            ),
-            (
-                "Predictions succeeded",
-                inference_diagnostics.get("predictions_succeeded", 0),
-            ),
-            (
-                "Predictions failed",
-                inference_diagnostics.get("predictions_failed", 0),
-            ),
-            (
-                "Rejected by threshold",
-                inference_diagnostics.get("alerts_rejected_threshold", 0),
-            ),
-            (
-                "Rejected by class",
-                inference_diagnostics.get("alerts_rejected_class_mapping", 0),
-            ),
-            ("Alerts stored", inference_diagnostics.get("alerts_stored", 0)),
-            (
-                "Feature errors",
-                inference_diagnostics.get("feature_extraction_failures", 0),
-            ),
-        )
-        for index, (label, value) in enumerate(diagnostic_metrics):
-            with diagnostic_columns[index % len(diagnostic_columns)]:
-                st.metric(label, value)
-
-        last_pipeline_error = inference_diagnostics.get("last_error")
-        if last_pipeline_error:
-            st.warning(
-                "Last pipeline error: "
-                f"{last_pipeline_error.get('stage', 'unknown stage')} "
-                f"({last_pipeline_error.get('error_type', 'unknown error')})"
-            )
-
-        recent_predictions = inference_diagnostics.get("recent_predictions", [])
-        if recent_predictions:
-            prediction_columns = (
-                "timestamp",
-                "binary_predicted_class",
-                "malware_probability",
-                "multiclass_predicted_class",
-                "multiclass_confidence",
-                "decision",
-                "stage",
-                "error_type",
-            )
-            st.dataframe(
-                [
-                    {column: record.get(column) for column in prediction_columns}
-                    for record in recent_predictions
-                ],
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.caption("No flow predictions have been recorded yet.")
+        render_live_pipeline_diagnostics()
 
         diag_c1, diag_c2 = st.columns(2)
     
